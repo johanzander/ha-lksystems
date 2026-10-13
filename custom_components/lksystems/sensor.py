@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -13,6 +15,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    EntityCategory,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
     UnitOfTemperature,
@@ -26,20 +29,31 @@ from homeassistant.helpers.update_coordinator import (
 )
 import homeassistant.util.dt as dt_util
 
-from . import LKSystemCoordinator
+from . import CubicSecureEntityMixin, LKSystemCoordinator
 from .const import (
-    ATTRIBUTION,
     C_NEXT_UPDATE_TIME,
     C_UPDATE_TIME,
-    CUBIC_SECURE_MODEL,
     DOMAIN,
     INTEGRATION_NAME,
     LK_CUBICSECURE_SENSORS,
     LK_CUBICSECURE_CONFIG_SENSORS,
-    MANUFACTURER,
+)
+from .restore import (
+    ATTR_LAST_SUCCESSFUL_CLOUD_FETCH,
+    RestoredNativeValueMixin,
+    last_successful_cloud_fetch_attributes,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_device_name(device_title: dict, fallback: str) -> str:
+    """Return the device's own display name, falling back to a default.
+
+    Not every device has a friendly "name" in deviceTitle - fall back so
+    the device (as opposed to any one entity on it) is never unnamed.
+    """
+    return device_title.get("name") or fallback
 
 
 async def async_setup_entry(
@@ -50,7 +64,6 @@ async def async_setup_entry(
     """Set up LK Systems sensor based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
-    entities = []
     processed_devices = set()  # Track processed devices to avoid duplicates
     created_entity_ids = set()  # Track entity IDs to avoid duplicates
 
@@ -70,61 +83,109 @@ async def async_setup_entry(
             device_title = device.get("deviceTitle", {})
 
             if device_title.get("deviceType") == "cubicsecure":
+                device_identity = device_title.get("identity")
                 _LOGGER.debug(
                     "Setting up LK Cubic sensors for %s",
-                    coordinator.data["cubic_machine_info"]["zone"]["zoneName"],
+                    coordinator.data["cubic_devices"][device_identity][
+                        "machine_info"
+                    ]["zone"]["zoneName"],
                 )
+                cubic_entities = []
                 for key, description in LK_CUBICSECURE_SENSORS.items():
                     if key == "volumetotal":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "volumetotalday":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "tempWaterAverage":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "tempWaterMin":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "tempWaterMax":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "waterPressure":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "ambientTemp":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "lastStatus":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "cacheUpdated":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "leak.leakState":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "leak.meanFlow":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "leak.dateStartedAt":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "leak.dateUpdatedAt":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
                     if key == "leak.acknowledged":
-                        entities.append(LKCubicSensor(coordinator, description))
+                        cubic_entities.append(
+                            LKCubicSensor(coordinator, description, device_identity)
+                        )
 
                 for key, description in LK_CUBICSECURE_CONFIG_SENSORS.items():
                     if key == "valveState":
-                        entities.append(
+                        cubic_entities.append(
                             LKCubicSensor(
-                                coordinator, description, data_source="configuration"
+                                coordinator,
+                                description,
+                                device_identity,
+                                data_source="configuration",
                             )
                         )
                     if key == "firmwareVersion":
-                        entities.append(
+                        cubic_entities.append(
                             LKCubicSensor(
-                                coordinator, description, data_source="configuration"
+                                coordinator,
+                                description,
+                                device_identity,
+                                data_source="configuration",
                             )
                         )
                     if key == "hardwareVersion":
-                        entities.append(
+                        cubic_entities.append(
                             LKCubicSensor(
-                                coordinator, description, data_source="configuration"
+                                coordinator,
+                                description,
+                                device_identity,
+                                data_source="configuration",
                             )
                         )
 
-                async_add_entities(entities, True)
+                cubic_entities.append(
+                    LKLeakDetectionPausedUntilSensor(coordinator, device_identity)
+                )
+                cubic_entities.append(
+                    LKNextUpdateDueSensor(coordinator, device_identity)
+                )
+
+                async_add_entities(cubic_entities, True)
 
             # Collect all hubs
             if device_title.get("deviceType") == "arc-hub":
@@ -376,6 +437,10 @@ async def async_setup_entry(
                                 SensorDeviceClass.SIGNAL_STRENGTH,
                                 SensorStateClass.MEASUREMENT,
                                 SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+                                # Signal-strength diagnostics, not a reading
+                                # most users watch day-to-day - the textbook
+                                # HA case for opt-in-only.
+                                entity_registry_enabled_default=False,
                             )
                         )
                         created_entity_ids.add(entity_id)
@@ -386,8 +451,15 @@ async def async_setup_entry(
         _LOGGER.debug("Added %d sensor entities", len(sensor_entities))
 
 
-class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
+class LKArcSensorEntity(RestoredNativeValueMixin, CoordinatorEntity, RestoreSensor):
     """Representation of an LK Systems sensor entity."""
+
+    _attr_has_entity_name = True
+    # These change on every poll; recording them would give the recorder a
+    # new attribute set to store for every sensor every poll.
+    _unrecorded_attributes = frozenset(
+        {C_UPDATE_TIME, C_NEXT_UPDATE_TIME, ATTR_LAST_SUCCESSFUL_CLOUD_FETCH}
+    )
 
     def __init__(
         self,
@@ -399,6 +471,7 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
         device_class: Optional[str] = None,
         state_class: Optional[str] = None,
         unit_of_measurement: Optional[str] = None,
+        entity_registry_enabled_default: bool = True,
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
@@ -409,6 +482,7 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
         self._attr_icon = icon
         self._attr_state_class = state_class
         self._attr_unit_of_measurement = unit_of_measurement
+        self._attr_entity_registry_enabled_default = entity_registry_enabled_default
 
         # Get device info
         device_title = device.get("deviceTitle", {})
@@ -434,20 +508,20 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
         # Set entity unique ID (must be consistent and unique)
         self._attr_unique_id = f"{DOMAIN}_{device_identity}_{entity_key}"
 
-        # Set entity name using friendly name if available
-        friendly_name = device_title.get("name")
-        if friendly_name:
-            self._attr_name = f"{friendly_name} {name_suffix}"
-        else:
-            room_name = (
-                device_title.get("zone", {}).get("zoneName")
-                if device_title.get("zone")
-                else None
-            )
-            if room_name:
-                self._attr_name = f"LK {room_name} {name_suffix}"
-            else:
-                self._attr_name = f"LK Sensor {name_suffix}"
+        # The entity's own name is just its suffix (e.g. "Temperature") -
+        # has_entity_name means HA combines it with the device name below
+        # to build the displayed name, rather than this class baking the
+        # device name into its own _attr_name.
+        self._attr_name = name_suffix
+
+        room_name = (
+            device_title.get("zone", {}).get("zoneName")
+            if device_title.get("zone")
+            else None
+        )
+        device_name = _resolve_device_name(
+            device_title, f"LK {room_name}" if room_name else "LK Sensor"
+        )
 
         # Get zone info for naming
         zone_name = None
@@ -457,7 +531,7 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
         # Set up device info with proper connection to parent if available
         device_info = {
             "identifiers": {(DOMAIN, device_identity)},
-            "name": self._attr_name.replace(f" {name_suffix}", ""),
+            "name": device_name,
             "manufacturer": "LK Systems",
             "model": device_type,
         }
@@ -510,9 +584,8 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
         """Return the unit of measurement."""
         return self._attr_unit_of_measurement
 
-    @property
-    def native_value(self) -> Any:
-        """Return the value of the sensor."""
+    def _live_native_value(self) -> Any:
+        """Return the value of the sensor from the coordinator's live data."""
         # First check device_details for the most up-to-date information
         if "device_details" in self.coordinator.data:
             device_details = self.coordinator.data["device_details"].get(
@@ -670,15 +743,6 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
             self._device_identity,
         )
 
-        # Add explicit check for value changes
-        old_value = self._attr_native_value
-        new_value = self.native_value
-
-        if old_value != new_value:
-            _LOGGER.warning(
-                "Value changed for %s: %s -> %s", self._attr_name, old_value, new_value
-            )
-
         self.async_write_ha_state()
 
     @property
@@ -693,28 +757,37 @@ class LKArcSensorEntity(CoordinatorEntity, SensorEntity):
             )
 
         # Add last update time
-        if self.coordinator and hasattr(self.coordinator, "_last_update_time"):
-            attrs["last_updated"] = self.coordinator._last_update_time.isoformat()
+        if self.coordinator and hasattr(self.coordinator, "_last_cloud_fetch_attempt"):
+            attrs[C_UPDATE_TIME] = (
+                self.coordinator._last_cloud_fetch_attempt.isoformat()
+            )
 
         # Add next scheduled update time
         if (
             self.coordinator
             and hasattr(self.coordinator, "update_interval")
-            and hasattr(self.coordinator, "_last_update_time")
+            and hasattr(self.coordinator, "_last_cloud_fetch_attempt")
         ):
-            next_update = (
-                self.coordinator._last_update_time + self.coordinator.update_interval
+            next_cloud_fetch_attempt = (
+                self.coordinator._last_cloud_fetch_attempt
+                + self.coordinator.update_interval
             )
-            attrs["next_update"] = next_update.isoformat()
+            attrs[C_NEXT_UPDATE_TIME] = next_cloud_fetch_attempt.isoformat()
 
-        # Add refresh button attribute with a timestamp to force UI refresh
-        attrs["refresh_timestamp"] = dt_util.now().timestamp()
+        attrs.update(
+            last_successful_cloud_fetch_attributes(
+                self.coordinator.last_successful_cloud_fetch
+            )
+        )
 
         return attrs
 
 
-class LKArcHubEntity(CoordinatorEntity, SensorEntity):
+class LKArcHubEntity(RestoredNativeValueMixin, CoordinatorEntity, RestoreSensor):
     """Representation of an LK Systems ARC Hub entity."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,
@@ -752,17 +825,13 @@ class LKArcHubEntity(CoordinatorEntity, SensorEntity):
         # Create unique ID using identity if available, otherwise mac
         self._attr_unique_id = f"{DOMAIN}_{device_identity}_{entity_key}"
 
-        # Set name - use device name if available
-        friendly_name = device_title.get("name")
-        if friendly_name:
-            self._attr_name = f"{friendly_name} {name_suffix}"
-        else:
-            self._attr_name = f"LK ARC Hub {name_suffix}"
+        self._attr_name = name_suffix
+        device_name = _resolve_device_name(device_title, "LK ARC Hub")
 
         # Set up device info
         device_info = {
             "identifiers": {(DOMAIN, device_identity)},
-            "name": self._attr_name.replace(f" {name_suffix}", ""),
+            "name": device_name,
             "manufacturer": "LK Systems",
             "model": device_type,
             "sw_version": None,
@@ -783,9 +852,8 @@ class LKArcHubEntity(CoordinatorEntity, SensorEntity):
         """Return the device class."""
         return self._device_class
 
-    @property
-    def native_value(self) -> Any:
-        """Return the value of the sensor."""
+    def _live_native_value(self) -> Any:
+        """Return the value of the sensor from the coordinator's live data."""
         # First check the device_details dictionary which has the most up-to-date information
         if "device_details" in self.coordinator.data:
             device_details = self.coordinator.data["device_details"].get(
@@ -844,43 +912,44 @@ class LKArcHubEntity(CoordinatorEntity, SensorEntity):
         """Handle updated data from the coordinator."""
         self.async_write_ha_state()
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the last-successful-cloud-fetch timestamp."""
+        return last_successful_cloud_fetch_attributes(
+            self.coordinator.last_successful_cloud_fetch
+        )
 
-class AbstractLkCubicSensor(CoordinatorEntity[LKSystemCoordinator], SensorEntity):
+
+class AbstractLkCubicSensor(
+    CubicSecureEntityMixin,
+    RestoredNativeValueMixin,
+    CoordinatorEntity[LKSystemCoordinator],
+    RestoreSensor,
+):
     """Abstract class for an LK Cubic secure sensor."""
-
-    _attr_attribution = ATTRIBUTION
-    _attr_has_entity_name = True
 
     def __init__(
         self,
         coordinator: LKSystemCoordinator,
         description: SensorEntityDescription,
+        device_identity: str,
     ) -> None:
         """Initialize the sensor."""
         _LOGGER.debug("Creating %s sensor", description.name)
         super().__init__(coordinator)
         self._coordinator = coordinator
-        self._device_model = CUBIC_SECURE_MODEL
-        self._device_name = (
-            f"Cubic Secure {coordinator.data['cubic_machine_info']['zone']['zoneName']}"
-        )
-        self._id = coordinator.data["cubic_machine_info"]["identity"]
+        self._device_identity = device_identity
         self.entity_description = description
         self.native_unit_of_measurement = description.native_unit_of_measurement
-        self._attr_unique_id = f"LkUid_{description.key}_{coordinator.data['cubic_machine_info']['identity']}"
+        self._attr_unique_id = f"LkUid_{description.key}_{device_identity}"
         self._attr_extra_state_attributes = {}
 
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return the device_info of the device."""
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, self._id)},
-            manufacturer=MANUFACTURER,
-            model=self._device_model,
-            name=self._device_name,
-            serial_number=self._id,
+    def _cubic_configuration(self) -> dict:
+        """Return this device's last-fetched configuration dict."""
+        device_data = self._coordinator.data.get("cubic_devices", {}).get(
+            self._device_identity, {}
         )
-        return device_info
+        return device_data.get("configuration") or {}
 
 
 class LKCubicSensor(AbstractLkCubicSensor):
@@ -890,14 +959,17 @@ class LKCubicSensor(AbstractLkCubicSensor):
         self,
         coordinator: LKSystemCoordinator,
         description: SensorEntityDescription,
+        device_identity: str,
         data_source: str = "measurement",
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(coordinator=coordinator, description=description)
+        super().__init__(
+            coordinator=coordinator,
+            description=description,
+            device_identity=device_identity,
+        )
         self._data_source = data_source
         self._data_key = description.key
-        self._attr_unique_id = f"LkUid_{description.key}_{coordinator.data['cubic_machine_info']['identity']}"
-        # self.native_unit_of_measurement = description.native_unit_of_measurement
         self._attr_extra_state_attributes = {}
 
         if "update_time" in self._coordinator.data:
@@ -908,6 +980,7 @@ class LKCubicSensor(AbstractLkCubicSensor):
             self._attr_extra_state_attributes.update(
                 {C_NEXT_UPDATE_TIME: self._coordinator.data["next_update_time"]}
             )
+        self._update_last_successful_cloud_fetch_attribute()
         self._attr_available = False
 
     async def async_update(self) -> None:
@@ -925,35 +998,139 @@ class LKCubicSensor(AbstractLkCubicSensor):
             self._attr_extra_state_attributes.update(
                 {C_NEXT_UPDATE_TIME: self._coordinator.data["next_update_time"]}
             )
+        self._update_last_successful_cloud_fetch_attribute()
         super()._handle_coordinator_update()
 
-    @property
-    def native_value(self) -> str | None:
-        """Get the latest state value."""
-        if self._data_source == "configuration":
-            if self._data_key in self._coordinator.data["cubic_configuration"]:
-                return self._coordinator.data["cubic_configuration"][self._data_key]
-            elif "." in self._data_key:
-                keys = self._data_key.split(".")
-                value = self._coordinator.data["cubic_configuration"]
-                for key in keys:
-                    value = value.get(key, None)
-                    if value is None:
-                        return None
-                return value
-            return None
-        elif self._data_source == "measurement":
-            _LOGGER.debug("Getting measurement for key: %s", self._data_key)
-            _LOGGER.debug(self._coordinator.data["cubic_last_measurement"])
-            if self._data_key in self._coordinator.data["cubic_last_measurement"]:
-                return self._coordinator.data["cubic_last_measurement"][self._data_key]
-            elif "." in self._data_key:
-                keys = self._data_key.split(".")
-                value = self._coordinator.data["cubic_last_measurement"]
-                for key in keys:
-                    value = value.get(key, None)
-                    if value is None:
-                        return None
-                return value
+    def _update_last_successful_cloud_fetch_attribute(self) -> None:
+        self._attr_extra_state_attributes.update(
+            last_successful_cloud_fetch_attributes(
+                self.coordinator.last_successful_cloud_fetch
+            )
+        )
 
-        return None
+    def _live_native_value(self) -> Any | None:
+        """Get the latest state value from the coordinator's live data."""
+        value = None
+        device_data = self._coordinator.data.get("cubic_devices", {}).get(
+            self._device_identity, {}
+        )
+
+        if self._data_source == "configuration":
+            cubic_configuration = self._cubic_configuration()
+            if self._data_key in cubic_configuration:
+                value = cubic_configuration[self._data_key]
+            elif "." in self._data_key:
+                keys = self._data_key.split(".")
+                value = cubic_configuration
+                for key in keys:
+                    value = value.get(key, None)
+                    if value is None:
+                        break
+        elif self._data_source == "measurement":
+            cubic_last_measurement = device_data.get("last_measurement") or {}
+            _LOGGER.debug("Getting measurement for key: %s", self._data_key)
+            _LOGGER.debug(cubic_last_measurement)
+            if self._data_key in cubic_last_measurement:
+                value = cubic_last_measurement[self._data_key]
+            elif "." in self._data_key:
+                keys = self._data_key.split(".")
+                value = cubic_last_measurement
+                for key in keys:
+                    value = value.get(key, None)
+                    if value is None:
+                        break
+
+        if value is not None and self.device_class == SensorDeviceClass.TIMESTAMP:
+            try:
+                return dt_util.utc_from_timestamp(float(value))
+            except (ValueError, TypeError):
+                pass
+
+        return value
+
+
+class LKLeakDetectionPausedUntilSensor(AbstractLkCubicSensor):
+    """When the device's leak detection will resume, if currently paused.
+
+    Reads LKSystemCoordinator.leak_detection_paused_until through
+    unchanged - see that attribute's own docstring for why it's tracked
+    locally rather than computed from the API's data on every read.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-pause-outline"
+    _attr_translation_key = "leak_detection_paused_until_sensor"
+
+    def __init__(self, coordinator: LKSystemCoordinator, device_identity: str) -> None:
+        """Initialize the sensor."""
+        description = SensorEntityDescription(
+            key="leakDetectionPausedUntil",
+            name="Leak Detection Paused Until",
+        )
+        super().__init__(
+            coordinator=coordinator,
+            description=description,
+            device_identity=device_identity,
+        )
+
+    def _live_native_value(self) -> datetime | None:
+        """Get the latest state value from the coordinator's live data."""
+        return self.coordinator.leak_detection_paused_until.get(self._device_identity)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the last-successful-cloud-fetch timestamp, matching every
+        other cubic sensor - see restore.py for why it needs to survive
+        across a restart."""
+        return last_successful_cloud_fetch_attributes(
+            self.coordinator.last_successful_cloud_fetch
+        )
+
+
+class LKNextUpdateDueSensor(
+    CubicSecureEntityMixin, CoordinatorEntity[LKSystemCoordinator], SensorEntity
+):
+    """When the coordinator's next scheduled poll is due.
+
+    A timestamp, not a live seconds-remaining countdown - a previous
+    version of this sensor ticked every second via its own timer, which
+    meant a recorder row every second, forever, confirmed to noticeably
+    bloat a real installation's database. A timestamp state only
+    changes once per actual poll (or reschedule - see
+    _publish_updated_data()'s own docstring), the same cadence as every
+    other sensor here; Home Assistant's frontend renders a live
+    relative countdown from a timestamp state entirely client-side,
+    with no repeated backend writes needed.
+    """
+
+    _attr_name = "Next Update Due"
+    _attr_icon = "mdi:timer-sand"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
+
+    def __init__(self, coordinator: LKSystemCoordinator, device_identity: str) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._device_identity = device_identity
+        self._attr_unique_id = f"LkUid_nextUpdateDue_{device_identity}"
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return when the coordinator's next scheduled poll is due."""
+        next_update_time = self.coordinator.data.get("next_update_time")
+        if next_update_time is None:
+            return None
+        return dt_util.parse_datetime(next_update_time)
+
+    async def async_update(self) -> None:
+        """No-op: no live fetch of its own - the value is derived from
+        data the coordinator already has.
+
+        Home Assistant calls this unconditionally (regardless of
+        should_poll) when a platform passes update_before_add=True to
+        async_add_entities() - sensor.py's own setup does exactly that
+        for every Cubic Secure sensor. Without this override,
+        CoordinatorEntity's own async_update() would call
+        coordinator.async_request_refresh() there, an extra API
+        round-trip this entity never needs."""

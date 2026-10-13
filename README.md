@@ -1,16 +1,20 @@
 # Custom Home Assistant integration for LK Systems
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs) 
+
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
 
 ## Summary
+
 This integration uses cloud polling from the API provided by LK Systems.
 
 The integration supports:
+
 - Water Meter [Cubic Secure](https://www.lksystems.se/sv/produkter/teknisk-armatur/vattenfelsutrustning/vattenfelsbrytare/lk-cubicsecure-77792594)
 - LK Arc thermostats [Arc Thermostats](https://www.lksystems.se/sv/produktsystem/golvvarme/lk-rumsreglering-arc/)
 
 ## Features
 
 ### LK Arc Thermostats
+
 - Temperature control with 0.5°C precision (range: 5°C - 30°C)
 - Real-time temperature monitoring
 - Automatic heat control (HVAC mode: Heat)
@@ -21,13 +25,14 @@ The integration supports:
 
 **Note**: The integration is in active development, as of now the support is in a very early stage use at own risk, breaking changes will most probably follow.. While core functionality is stable, additional features may be added in future updates.
 
+## Installation
 
-# Installation
 ### HACS installation
+
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=angoyd&repository=ha-lksystems&category=integration)
 
-
 ### Git installation
+
 1. Make sure you have git installed on your machine.
 2. Navigate to you home assistant configuration folder.
 3. Create a `custom_components` folder of it does not exist, navigate down into it after creation.
@@ -35,5 +40,91 @@ The integration supports:
 5. Restart Home-Assistant.
 
 ## Enable the integration
+
 Go to Settings / Devices & Services / Integrations. Click **+ ADD INTEGRATION**
 Follow the instructions
+
+## Contributing
+
+Contributions are welcome, whether that's a bug fix, a new sensor/entity, or tests for existing code.
+
+### Setting up a dev environment
+
+1. Fork the repo and clone your fork.
+2. Install the test dependencies: `pip install -r requirements_test.txt`
+
+### Running the tests
+
+There are two suites, run as separate `pytest` invocations (see below for why):
+
+```bash
+pytest tests/ -p no:homeassistant
+pytest tests_ha/
+```
+
+`tests/` covers `custom_components/lksystems/pylksystems` (the LK Systems API client) and mocks all HTTP calls with [aioresponses](https://github.com/pnuckowski/aioresponses) — no real LK Systems account needed.
+
+`tests_ha/` covers the pieces that import `homeassistant` directly (`__init__.py`, `climate.py`, `sensor.py`, `config_flow.py`, `services.py`) using Home Assistant's own test harness, [`pytest-homeassistant-custom-component`](https://github.com/MatthewFlamm/pytest-homeassistant-custom-component). Requires Python 3.12+.
+
+The `-p no:homeassistant` flag on the first command matters: once `pytest-homeassistant-custom-component` is installed, it registers a global autouse cleanup fixture that checks every test in the session for lingering threads/timers — including ones in `tests/` that never touch Home Assistant at all — and it trips on a background thread aiohttp itself leaves behind. Disabling the plugin for that invocation avoids the false positive; it's picked back up for `tests_ha/`.
+
+### Deploying to a test Home Assistant instance
+
+`deploy.sh` syncs your local `custom_components/lksystems/` straight into a running Home Assistant instance over SSH, for testing changes against a real account before opening a PR.
+
+```bash
+./deploy.sh <user> <host>
+# e.g. ./deploy.sh homeassistant homeassistant.local
+```
+
+Requirements on the target instance: SSH access (e.g. the [Terminal & SSH add-on](https://github.com/home-assistant/addons/tree/master/ssh) on HAOS) reachable with `ssh <user>@<host>`, and a `/config` directory. The script creates `/config/custom_components/lksystems/` if needed and `rsync --delete`s the integration's files there, so the remote directory always ends up an exact mirror of your local `custom_components/lksystems/` - no stale files left over from a previously-deployed branch masking what's actually being tested.
+
+After syncing, reload the integration (**Settings → Devices & Services → LK Systems → ⋮ → Reload**), or restart HA on a first install.
+
+Copy `.env.example` to `.env` and fill in `HA_SSH_HOST`/`HA_SSH_USER` (`.env` is gitignored) to run `./deploy.sh` with no arguments instead of typing them every time.
+
+`tail_logs.py` polls Home Assistant's WebSocket API (`system_log/list`) and prints new lines, filtered to this integration by default - useful for watching a live test (e.g. a rate-limit check) as it happens. It uses the WebSocket API rather than tailing a log file over SSH (where - or whether - Home Assistant writes a log file to disk varies by install type and by each instance's own logger config) and rather than the REST API's `GET /api/error_log` (still listed in Home Assistant's developer docs, but removed from Core - confirmed returning a 404 against a real instance). Needs `HA_LONG_LIVED_TOKEN` in `.env` (see `.env.example` for how to generate a token); `HA_URL` there is optional, defaulting to `https://$HA_SSH_HOST:8123`. Uses `aiohttp` (already a project dependency).
+
+A long-lived token only covers the REST/WebSocket API, not the web frontend itself - for anything that needs confirming against the *actual UI* (exact wording/labels before writing user-facing text like a repair issue's instructions, or admin-only pages such as Developer Tools) an AI coding assistant with browser automation needs real frontend login credentials. Set `HA_UI_USERNAME`/`HA_UI_PASSWORD` in `.env` for a temporary or limited account with admin rights - most of what needs checking is admin-only.
+
+### Using the Home Assistant MCP server for live testing
+
+If your test instance has the built-in [**Model Context Protocol Server**](https://www.home-assistant.io/integrations/mcp_server/) integration enabled, an AI coding assistant (like Claude Code) can query live entity states and call services directly against it — useful for verifying a change actually behaves correctly in HA, not just that the unit tests pass.
+
+To set it up:
+
+1. In HA, add the **Model Context Protocol Server** integration and create a long-lived access token for it (**Settings → People → your profile → Security → Long-lived access tokens**).
+2. Install [`mcp-proxy`](https://github.com/sparfenyuk/mcp-proxy) locally (e.g. `pip install --user mcp-proxy`), which bridges your editor/tool's MCP client to HA's HTTP-based MCP endpoint (`https://<host>:8123/api/mcp`). At time of writing, `mcp-proxy` needs `mcp<2` (`pip install --user "mcp==1.29.0"`) — the just-released `mcp` 2.0.0 changed internals in a way `mcp-proxy` 0.12.0 doesn't support yet.
+3. Point your tool's MCP config at it, e.g. for Claude Code, a project-local `.mcp.json`. The token goes in as an `Authorization: Bearer` header via `-H`, not an environment variable:
+
+   ```json
+   {
+     "mcpServers": {
+       "Home Assistant": {
+         "command": "mcp-proxy",
+         "args": [
+           "--transport=streamablehttp",
+           "--stateless",
+           "-H",
+           "Authorization",
+           "Bearer <your-long-lived-token>",
+           "https://<your-host>:8123/api/mcp"
+         ]
+       }
+     }
+   }
+   ```
+
+Keep this file out of version control (it's gitignored here) since it points at your personal instance and carries a live token.
+
+### Submitting a change
+
+1. Create a branch off `main` in your fork.
+2. If you're changing behavior in `pylksystems`, please add or update a test alongside the change — see `tests/test_pylksystems.py` for the existing pattern.
+3. Open a pull request against `main` describing what changed and why.
+
+CI runs the test suite automatically on every pull request.
+
+### API documentation
+
+The integration uses the API exposed by LK System. [API documentation](https://lk-home-assistant-prod.developer.azure-api.net/)

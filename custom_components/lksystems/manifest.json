@@ -1,6 +1,7 @@
 {
   "domain": "lksystems",
   "name": "LK Systems",
+  "after_dependencies": ["logbook"],
   "codeowners": [
     "@angoyd"
   ],
@@ -10,9 +11,9 @@
   "homekit": {},
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/angoyd/ha-lksystems/issues",
-  "requirements": ["aiohttp>=3.9.1"],
+  "requirements": [],
+  "single_config_entry": true,
   "ssdp": [],
-  "version": "0.0.4",
+  "version": "0.4.7",
   "zeroconf": []
 }
-

@@ -2,18 +2,149 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
 from typing import TypedDict
 
 
-from aiohttp import ClientError, ClientResponseError, ClientSession
+from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout
 from dateutil.relativedelta import relativedelta
 
 _LOGGER = logging.getLogger(__name__)
+
+# Header names (case-insensitive) whose values must never be logged verbatim.
+_SENSITIVE_HEADERS = {"authorization", "ocp-apim-subscription-key"}
+_REDACTED = "***REDACTED***"
+
+
+def _redact_headers(headers: dict) -> dict:
+    """Return a copy of headers with sensitive values replaced for logging."""
+    if not headers:
+        return headers
+    return {
+        key: _REDACTED if key.lower() in _SENSITIVE_HEADERS else value
+        for key, value in headers.items()
+    }
+# aiohttp defaults to a 300s total timeout when none is set. That lets one
+# slow/unresponsive LK API call stall an entire coordinator update for up to
+# 5 minutes before it even fails - fail fast instead.
+REQUEST_TIMEOUT = ClientTimeout(total=20)
+
+# LK's cloud API rate-limiting (429) during a burst of activity is routine,
+# not a genuine error - retry with backoff rather than failing immediately.
+RATE_LIMIT_STATUS = 429
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_DEFAULT_BACKOFF = 5.0  # seconds, used when no Retry-After header
+RATE_LIMIT_MIN_BACKOFF = 1.0  # seconds; see _rate_limit_backoff() for why
+
+# A connection-level failure (a dropped connection, DNS blip, or a request
+# that never got a response at all before REQUEST_TIMEOUT fired) is usually
+# as transient as a 429 - retry it the same way rather than failing the
+# whole call on one bad attempt. Deliberately separate from a genuine HTTP
+# error response (ClientResponseError, e.g. a real 401): that must keep
+# failing immediately, never retried as if it might resolve itself.
+TRANSIENT_ERROR_MAX_RETRIES = 3
+TRANSIENT_ERROR_BACKOFF_SECONDS = 2.0
+
+_GET_SUCCESS_STATUSES = frozenset({200})
+_POST_SUCCESS_STATUSES = frozenset({200, 201})
+
+
+def _rate_limit_backoff(response) -> float:
+    """Return the delay to wait before retrying a 429 response.
+
+    Honors the Retry-After header (seconds) when LK's API provides one,
+    falling back to a default backoff otherwise. Never returns less than
+    RATE_LIMIT_MIN_BACKOFF - a Retry-After of 0 would otherwise collapse
+    the retry into an immediate one, indistinguishable from not backing
+    off at all.
+    """
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return max(float(retry_after), RATE_LIMIT_MIN_BACKOFF)
+        except ValueError:
+            pass
+    return RATE_LIMIT_DEFAULT_BACKOFF
+
+
+# A 429's Retry-After is server truth, not any one caller's to own - every
+# LKSystemsManager instance in the process constructs its own session, so
+# this cooldown deadline is deliberately module-level rather than an
+# instance attribute. Module-level (not per-user) is also the right shape
+# for what LK Systems confirmed directly: the limit is keyed by source IP,
+# not by subscription key, so one process's shared state accurately
+# mirrors the server's own per-IP tracking rather than approximating it.
+# Keyed per endpoint path rather than one global bucket: LK also confirmed
+# not every endpoint carries the same limit, matching every 429 observed so
+# far landing on one specific endpoint, none on others - a single global
+# cooldown would block unrelated endpoints for no reason.
+_rate_limited_until: dict[str, datetime] = {}
+
+
+def _rate_limit_wait_remaining(endpoint: str) -> float:
+    """Return seconds still left on endpoint's shared cooldown, or 0."""
+    deadline = _rate_limited_until.get(endpoint)
+    if deadline is None:
+        return 0.0
+    return max((deadline - datetime.now(timezone.utc)).total_seconds(), 0.0)
+
+
+def _record_rate_limited(endpoint: str, backoff_seconds: float) -> None:
+    """Record a fresh 429's Retry-After as endpoint's shared cooldown."""
+    _rate_limited_until[endpoint] = datetime.now(timezone.utc) + timedelta(
+        seconds=backoff_seconds
+    )
+
+
+def _clear_rate_limit(endpoint: str) -> None:
+    """Clear endpoint's shared cooldown after a successful request."""
+    _rate_limited_until.pop(endpoint, None)
+
+
+def _retry_delay_for_response(response, attempt: int) -> float | None:
+    """Return the backoff delay if response is a retryable 429, else None."""
+    if response.status == RATE_LIMIT_STATUS and attempt < RATE_LIMIT_MAX_RETRIES:
+        return _rate_limit_backoff(response)
+    return None
+
+
+def iter_realestate_machines(structures):
+    """Yield every (realestate, machine) pair across a list of realestate
+    structures - the shape get_user_structure() and get_devices()'s own
+    live fetch both return."""
+    for realestate in structures or []:
+        if isinstance(realestate, dict):
+            for machine in realestate.get("realestateMachines", []):
+                yield realestate, machine
+
+
+def _device_from_machine(machine, cache_updated):
+    """Build a device entry from one realestateMachines item, or None for
+    a Cubic Secure machine - those are handled through their own dedicated
+    endpoints rather than as a generic device."""
+    if (
+        machine.get("deviceType") == "cubicsecure"
+        and machine.get("deviceRole") == "cubicsecure"
+    ):
+        return None
+
+    device_data = {
+        "deviceTitle": machine,
+        "mac": machine.get("identity"),
+        "cacheUpdated": cache_updated,
+    }
+    if machine.get("deviceGroup") == "arc":
+        device_data["deviceGroup"] = "arc"
+        device_data["deviceType"] = machine.get("deviceType")
+        device_data["deviceRole"] = machine.get("deviceRole")
+        if "zone" in machine:
+            device_data["zone"] = machine["zone"]
+    return device_data
 
 
 # Add the missing LKSystemsError class
@@ -54,21 +185,39 @@ class LKThresholds(TypedDict):
     leakLarge: LKLeakThresholds
 
 
+def thresholds_with_overrides(
+    current: LKThresholds | dict, category: str, overrides: dict
+) -> dict:
+    """Return a full thresholds payload with one category's fields
+    overridden, carrying every other current value over unchanged.
+
+    cubic_secure_set_thresholds() only accepts the complete object at
+    once - there's no per-field patch endpoint - so every caller building
+    a change from just one or two fields (a number entity, the
+    set_thresholds service) needs this same carry-forward, not a fresh
+    copy of it. Never mutates `current` itself.
+    """
+    updated = {key: dict(value) for key, value in current.items()}
+    updated.setdefault(category, {}).update(overrides)
+    return updated
+
+
 class LKSystemsManager:
     """LKSystems manager."""
+
+    BASE_URL = "https://link2.lk.nu/"
 
     def __init__(self, username, password) -> None:
         """Initialize the LK systems manager."""
         if username is None or password is None:
             raise ValueError("Username and password must be provided.")
         self.session = None
-        self.base_url = "https://link2.lk.nu/"
         self.username = username
         self.password = password
         self.userid = None
         self.jwt_token = None
         self.refresh_token = None
-        self._cubic_secure_messurement = None
+        self._cubic_secure_measurement = None
         self._user_structure = None
         self._cubic_secure_configuration = None
         self._cubic_secure_pressure_test_reports = None
@@ -78,10 +227,16 @@ class LKSystemsManager:
         self._hub_devices = None
         self._device_measurements = {}
         self._device_configurations = {}
+        # Set whenever a 429 is observed by _request_with_retry() (whether
+        # eventually retried successfully or not), reset to None at the
+        # start of every call - lets a caller learn "that failed because
+        # of rate limiting, retry after N seconds" without changing what
+        # any existing call returns.
+        self.last_rate_limit_retry_after: float | None = None
 
     async def __aenter__(self):
         """Asynchronous enter."""
-        self.session = ClientSession()
+        self.session = ClientSession(timeout=REQUEST_TIMEOUT)
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
@@ -90,10 +245,27 @@ class LKSystemsManager:
 
     async def handle_client_error(self, endpoint, headers, error):
         """Handle ClientError and log relevant information."""
+        if (
+            isinstance(error, ClientResponseError)
+            and error.status == RATE_LIMIT_STATUS
+        ):
+            # Routine, expected condition on LK's end, not a genuine error -
+            # log at warning rather than error. Callers going through
+            # _get()/_post() have already retried with backoff by the time
+            # this fires; other call sites that make their own raw request
+            # (e.g. set_device_temperature()) land here on the first 429.
+            _LOGGER.warning(
+                "Rate limited (429) by LK Systems API. URL: %s",
+                self.BASE_URL + endpoint,
+            )
+            return False
+
         _LOGGER.error(
-            "An error occurred during the request. URL: %s, Headers: %s. Error: %s",
-            self.base_url + endpoint,
-            headers,
+            "An error occurred during the request. URL: %s, Headers: %s. "
+            "Error: %s: %s",
+            self.BASE_URL + endpoint,
+            _redact_headers(headers),
+            type(error).__name__,
             error,
         )
         return False
@@ -109,99 +281,182 @@ class LKSystemsManager:
             "ocp-apim-subscription-key": "d2d308826cd14e7d92660b28bc7d859c",
         }
 
-    async def _get(self, endpoint):
+    async def _log_and_sleep(self, delay: float, message: str, *args) -> None:
+        """Log a warning and wait out delay - the shared shape behind both
+        a reactive 429 backoff and a pre-emptive shared-cooldown wait."""
+        _LOGGER.warning(message, *args)
+        await asyncio.sleep(delay)
+
+    async def _sleep_before_retry(self, endpoint: str, delay: float, attempt: int) -> None:
+        """Log and wait out a 429's backoff before the next retry attempt."""
+        await self._log_and_sleep(
+            delay,
+            "Rate limited (429) by LK Systems API, retrying %s in %.1fs (attempt %d/%d)",
+            self.BASE_URL + endpoint,
+            delay,
+            attempt + 1,
+            RATE_LIMIT_MAX_RETRIES,
+        )
+
+    async def _wait_out_shared_cooldown(self, endpoint: str, url: str) -> None:
+        """Wait out any cooldown an earlier 429 already recorded for endpoint.
+
+        Checked pre-emptively before firing a request, so a caller that
+        already knows it's cooling down doesn't spend a request to find
+        that out again.
+        """
+        remaining = _rate_limit_wait_remaining(endpoint)
+        if remaining <= 0:
+            return
+        await self._log_and_sleep(
+            remaining,
+            "Endpoint %s is under a shared rate-limit cooldown from an "
+            "earlier request, waiting %.1fs before requesting",
+            url,
+            remaining,
+        )
+
+    async def _request_with_retry(
+        self,
+        endpoint: str,
+        send_request,
+        success_statuses: frozenset[int],
+        parse_response,
+        max_wait: float | None,
+    ):
+        """Shared GET/POST retry loop: honors the endpoint's shared 429
+        cooldown pre-emptively, retries a fresh 429 with backoff up to
+        RATE_LIMIT_MAX_RETRIES, and records/clears that shared cooldown
+        from what this call itself observes.
+
+        When max_wait is given, the whole call - any pre-emptive wait plus
+        any retries - is capped to that many seconds; running out of budget
+        is treated like any other failed fetch and never touches the shared
+        cooldown, which is real server-side state for whoever asks next.
+        """
+        url = self.BASE_URL + endpoint
+        self.last_rate_limit_retry_after = None
+
+        async def attempt() -> tuple[bool, dict | None]:
+            await self._wait_out_shared_cooldown(endpoint, url)
+            headers = {}
+            retry_attempt = 0
+            while True:
+                try:
+                    headers = {
+                        **self._get_headers(),
+                        "authorization": f"Bearer {self.jwt_token}",
+                    }
+
+                    async with send_request(headers) as response:
+                        if response.status == RATE_LIMIT_STATUS:
+                            backoff = _rate_limit_backoff(response)
+                            _record_rate_limited(endpoint, backoff)
+                            self.last_rate_limit_retry_after = backoff
+
+                        delay = _retry_delay_for_response(response, retry_attempt)
+                        if delay is None:
+                            response.raise_for_status()
+                            if response.status in success_statuses:
+                                _clear_rate_limit(endpoint)
+                                return True, await parse_response(response)
+
+                            _LOGGER.error(
+                                "Request to URL %s failed with status code %d",
+                                url,
+                                response.status,
+                            )
+                            return False, None
+
+                    # Deliberately kept outside the `async with` above -
+                    # moving it back in would hold the connection open for
+                    # the whole backoff instead of releasing it first.
+                    await self._sleep_before_retry(endpoint, delay, retry_attempt)
+                    retry_attempt += 1
+
+                except ClientResponseError as error:
+                    # A real HTTP error status came back (e.g. a genuine
+                    # 401) - that's not going to resolve itself on a
+                    # retry, unlike a connection-level failure below.
+                    return (
+                        await self.handle_client_error(endpoint, headers, error)
+                    ), None
+
+                except (ClientError, asyncio.TimeoutError) as error:
+                    if retry_attempt >= TRANSIENT_ERROR_MAX_RETRIES:
+                        return (
+                            await self.handle_client_error(endpoint, headers, error)
+                        ), None
+                    retry_attempt += 1
+                    await self._log_and_sleep(
+                        TRANSIENT_ERROR_BACKOFF_SECONDS,
+                        "Connection error on %s, retrying in %.1fs "
+                        "(attempt %d/%d): %s",
+                        url,
+                        TRANSIENT_ERROR_BACKOFF_SECONDS,
+                        retry_attempt,
+                        TRANSIENT_ERROR_MAX_RETRIES,
+                        error,
+                    )
+
+        try:
+            return await asyncio.wait_for(attempt(), timeout=max_wait)
+        except asyncio.TimeoutError:
+            return False, None
+
+    async def _get(self, endpoint, max_wait: float | None = None):
         """Helper method to perform GET requests."""
-        headers = {}
-        try:
-            # Define headers with the JwtToken
-            headers = {
-                **self._get_headers(),
-                "authorization": f"Bearer {self.jwt_token}",
-            }
+        return await self._request_with_retry(
+            endpoint,
+            lambda headers: self.session.get(
+                self.BASE_URL + endpoint, headers=headers
+            ),
+            success_statuses=_GET_SUCCESS_STATUSES,
+            parse_response=lambda response: response.json(),
+            max_wait=max_wait,
+        )
 
-            async with self.session.get(
-                self.base_url + endpoint, headers=headers
-            ) as response:
-                response.raise_for_status()
-                if response.status == 200:
-                    res = await response.json()
-
-                    return True, res
-
-                _LOGGER.error(
-                    "Obtaining data from URL %s failed with status code %d",
-                    self.base_url + endpoint,
-                    response.status,
-                )
-                return False, None
-
-        except (ClientResponseError, ClientError) as error:
-            return (await self.handle_client_error(endpoint, headers, error)), None
-
-    async def _post(self, endpoint, payload):
+    async def _post(self, endpoint, payload, max_wait: float | None = None):
         """Helper method to perform POST requests."""
-        headers = {}
-        try:
-            # Define headers with the JwtToken
-            headers = {
-                **self._get_headers(),
-                "authorization": f"Bearer {self.jwt_token}",
-            }
-
-            async with self.session.post(
-                self.base_url + endpoint, json=payload, headers=headers
-            ) as response:
-                response.raise_for_status()
-                if response.status in [200, 201]:
-                    res = await response.json(content_type=None)
-
-                    return True, res
-
-                _LOGGER.error(
-                    "Posting data to URL %s failed with status code %d",
-                    self.base_url + endpoint,
-                    response.status,
-                )
-                return False, None
-
-        except (ClientResponseError, ClientError) as error:
-            return (await self.handle_client_error(endpoint, headers, error)), None
+        return await self._request_with_retry(
+            endpoint,
+            lambda headers: self.session.post(
+                self.BASE_URL + endpoint, json=payload, headers=headers
+            ),
+            success_statuses=_POST_SUCCESS_STATUSES,
+            parse_response=lambda response: response.json(content_type=None),
+            max_wait=max_wait,
+        )
 
     async def login(self):
         """Login to LK systems and get userId"""
         endpoint = "auth/auth/login"
-        endpointUserId = "auth/auth/user"
         try:
             payload = {"email": self.username, "password": self.password}
             headers = {**self._get_headers()}
             # Define headers with the encoded credentials
             async with self.session.post(
-                self.base_url + endpoint, json=payload, headers=headers
+                self.BASE_URL + endpoint, json=payload, headers=headers
             ) as response:
                 data = await response.json()
                 if response.status == 200:
                     self.jwt_token = data.get("accessToken")
                     self.refresh_token = data.get("refreshToken")
-                    # Get userId
-                    headers = {
-                        **self._get_headers(),
-                        "authorization": f"Bearer {self.jwt_token}",
-                    }
-                    async with self.session.get(
-                        self.base_url + endpointUserId, headers=headers
-                    ) as responseUserid:
-                        responseUserid.raise_for_status()
-                        if responseUserid.status == 200:
-                            useridJson = await responseUserid.json()
-                            self.userid = useridJson["userId"]
-                            return True
 
-                        _LOGGER.error(
-                            "Obtaining data from URL %s failed with status code %d",
-                            self.base_url + endpoint,
-                            responseUserid.status,
-                        )
-                        return False
+                    success, userid_data = await self._get("auth/auth/user")
+                    if success:
+                        self.userid = userid_data["userId"]
+                        return True
+
+                    _LOGGER.error(
+                        "Login succeeded but could not obtain the account's "
+                        "userid from %sauth/auth/user - if you see this "
+                        "repeatedly, a comment on issue #17 with the "
+                        "timestamp and whether it happened right after a "
+                        "restart/fresh login would help diagnose it.",
+                        self.BASE_URL,
+                    )
+                    return False
 
                 if response.status == 401:
                     _LOGGER.error(
@@ -212,7 +467,7 @@ class LKSystemsManager:
                 _LOGGER.error("Unexpected HTTP status code: %s", response.status)
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def get_cubic_secure_measurement(
@@ -226,87 +481,80 @@ class LKSystemsManager:
             endpoint = f"service/cubic/secure/{cubic_identity}/measurement/0"
         success, res = await self._get(endpoint)
         if success:
-            self._cubic_secure_messurement = res
+            self._cubic_secure_measurement = res
             return True
         return False
 
     @property
-    def cubic_secure_messurement(self):
-        """Property for Cubic Secure messurement"""
-        return self._cubic_secure_messurement
+    def cubic_secure_measurement(self):
+        """Property for Cubic Secure measurement"""
+        return self._cubic_secure_measurement
 
     async def get_user_structure(self):
-        """Fetch user secure measurement"""
+        """Fetch user structure"""
         endpoint = f"service/users/user/{self.userid}/structure/1"
         success, res = await self._get(endpoint)
         if success:
-            self._user_structure = res[0]
+            if not res:
+                # Accounts with no devices/realestates registered get back
+                # an empty list rather than a missing structure.
+                _LOGGER.warning(
+                    "User structure response was empty - account has no "
+                    "devices or realestates registered"
+                )
+                self._user_structure = None
+                return False
+            # The response is a list of every realestate on the account,
+            # not just one - keep all of them so devices registered under
+            # a second property aren't dropped.
+            self._user_structure = res
             return True
         return False
 
     @property
     def user_structure(self):
-        """Property for User Structure"""
+        """Property for the account's realestates, each with its own
+        devices - a list, since an account can have more than one."""
         return self._user_structure
 
     def get_arc_hubs_from_structure(self):
-        """Extract Arc hub devices from user structure."""
-        if not self._user_structure or "realestateMachines" not in self._user_structure:
+        """Extract Arc hub devices from every realestate in the user structure."""
+        if not self._user_structure:
             return []
 
-        arc_hubs = []
-        for machine in self._user_structure["realestateMachines"]:
+        return [
+            machine
+            for _, machine in iter_realestate_machines(self._user_structure)
             if (
                 machine.get("deviceGroup") == "arc"
                 and machine.get("deviceType") == "arc-hub"
                 and machine.get("deviceRole") == "arc-hub"
                 and machine.get("identity")
-            ):
-                arc_hubs.append(machine)
-
-        return arc_hubs
+            )
+        ]
 
     def extract_devices_from_structure(self):
-        """Extract devices from user structure if available."""
+        """Extract devices from every realestate in the user structure, if available."""
         if not self._user_structure:
             _LOGGER.debug("User structure not yet available, cannot extract devices")
             return None
 
         try:
-            # Create a devices structure from the user structure data
             devices = []
+            latest_cache_updated = 0
 
-            # Extract all machines (devices) from realestateMachines
-            if "realestateMachines" in self._user_structure:
-                for machine in self._user_structure["realestateMachines"]:
-                    # Skip cubic devices as they're handled separately
-                    if (
-                        machine.get("deviceType") == "cubicsecure"
-                        and machine.get("deviceRole") == "cubicsecure"
-                    ):
-                        continue
+            for realestate, machine in iter_realestate_machines(self._user_structure):
+                cache_updated = realestate.get("cacheUpdated", 0)
+                latest_cache_updated = max(latest_cache_updated, cache_updated)
 
-                    device_data = {
-                        "deviceTitle": machine,
-                        "mac": machine.get("identity"),
-                        "cacheUpdated": self._user_structure.get("cacheUpdated", 0),
-                    }
-
-                    # Add extra information for Arc devices
-                    if machine.get("deviceGroup") == "arc":
-                        device_data["deviceGroup"] = "arc"
-                        device_data["deviceType"] = machine.get("deviceType")
-                        device_data["deviceRole"] = machine.get("deviceRole")
-                        if "zone" in machine:
-                            device_data["zone"] = machine["zone"]
-
-                    devices.append(device_data)
+                device = _device_from_machine(machine, cache_updated)
+                if device is not None:
+                    devices.append(device)
 
             _LOGGER.debug("Extracted %d devices from user structure", len(devices))
-            # Return in the expected format
             return {
                 "devices": devices,
-                "cacheUpdated": self._user_structure.get("cacheUpdated", 0),
+                "cacheUpdated": latest_cache_updated,
             }
         except Exception as err:
             _LOGGER.warning("Error extracting devices from user structure: %s", err)
@@ -346,7 +594,7 @@ class LKSystemsManager:
 
             _LOGGER.debug("Fetching detailed device information from API")
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -359,43 +607,16 @@ class LKSystemsManager:
                         _LOGGER.debug(
                             "API returned a list with %d items", len(api_response)
                         )
+
                         api_devices = []
-
-                        # Extract devices from each structure
-                        for structure in api_response:
-                            if (
-                                isinstance(structure, dict)
-                                and "realestateMachines" in structure
-                            ):
-                                for machine in structure.get("realestateMachines", []):
-                                    # Skip cubic devices as they're handled separately
-                                    if (
-                                        machine.get("deviceType") == "cubicsecure"
-                                        and machine.get("deviceRole") == "cubicsecure"
-                                    ):
-                                        continue
-
-                                    device_data = {
-                                        "deviceTitle": machine,
-                                        "mac": machine.get("identity"),
-                                        "cacheUpdated": structure.get(
-                                            "cacheUpdated", 0
-                                        ),
-                                    }
-
-                                    # Add extra information for Arc devices
-                                    if machine.get("deviceGroup") == "arc":
-                                        device_data["deviceGroup"] = "arc"
-                                        device_data["deviceType"] = machine.get(
-                                            "deviceType"
-                                        )
-                                        device_data["deviceRole"] = machine.get(
-                                            "deviceRole"
-                                        )
-                                        if "zone" in machine:
-                                            device_data["zone"] = machine["zone"]
-
-                                    api_devices.append(device_data)
+                        for realestate, machine in iter_realestate_machines(
+                            api_response
+                        ):
+                            device = _device_from_machine(
+                                machine, realestate.get("cacheUpdated", 0)
+                            )
+                            if device is not None:
+                                api_devices.append(device)
 
                         # Create a dictionary structure
                         api_data = {
@@ -442,7 +663,7 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining devices data from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 # Even if API call fails, return True if we have devices from structure
@@ -451,7 +672,7 @@ class LKSystemsManager:
                     and len(self._devices.get("devices", [])) > 0
                 )
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             # Handle the error but don't immediately return False
             await self.handle_client_error(endpoint, headers, error)
             # Return True if we already have devices from structure
@@ -483,7 +704,7 @@ class LKSystemsManager:
             }
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -493,12 +714,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining hub devices from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     @property
@@ -527,7 +748,7 @@ class LKSystemsManager:
             )
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -542,12 +763,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining Arc Sense measurement from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def get_arc_sense_configuration(self, arc_sense_mac: str, force_update=False):
@@ -571,7 +792,7 @@ class LKSystemsManager:
             )
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -586,12 +807,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining Arc Sense configuration from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def get_device_measurement(self, device_identity: str, force_update=False):
@@ -619,7 +840,7 @@ class LKSystemsManager:
             # _LOGGER.info("Fetching measurement data for device %s", device_identity)
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -632,12 +853,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining device measurement from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def get_device_configuration(self, device_identity: str, force_update=False):
@@ -665,7 +886,7 @@ class LKSystemsManager:
             _LOGGER.debug("Fetching configuration data for device %s", device_identity)
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -674,12 +895,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining device configuration from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def get_device_title(self, device_identity: str, force_update=False):
@@ -701,7 +922,7 @@ class LKSystemsManager:
             _LOGGER.debug("Fetching title data for device %s", device_identity)
 
             async with self.session.get(
-                self.base_url + endpoint, headers=headers
+                self.BASE_URL + endpoint, headers=headers
             ) as response:
                 response.raise_for_status()
                 if response.status == 200:
@@ -713,12 +934,12 @@ class LKSystemsManager:
 
                 _LOGGER.error(
                     "Obtaining device title from URL %s failed with status code %d",
-                    self.base_url + endpoint,
+                    self.BASE_URL + endpoint,
                     response.status,
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def set_device_temperature(self, device_identity: str, temperature: float):
@@ -780,7 +1001,7 @@ class LKSystemsManager:
                 )
 
                 async with self.session.post(
-                    self.base_url + endpoint, json=update_data, headers=headers
+                    self.BASE_URL + endpoint, json=update_data, headers=headers
                 ) as response:
                     response.raise_for_status()
                     if response.status == 200:
@@ -804,11 +1025,11 @@ class LKSystemsManager:
                 )
                 return False
 
-        except (ClientResponseError, ClientError) as error:
+        except (ClientResponseError, ClientError, asyncio.TimeoutError) as error:
             return await self.handle_client_error(endpoint, headers, error)
 
     async def set_thermostat_temperature(self, device_id, temperature):
-        """Set thermostat temperature through the API.
+        """Set thermostat temperature through the Device Control API.
 
         Args:
             device_id: The device identity (MAC or unique ID)
@@ -817,73 +1038,17 @@ class LKSystemsManager:
         Returns:
             Result dictionary containing success status and any response data
         """
-        result = {"success": False, "data": None, "error": None}
+        endpoint = f"control/arc/sense/{device_id}/temperature"
+        _LOGGER.debug("Setting thermostat %s to temperature %s", device_id, temperature)
 
-        try:
-            # Use the correct Azure endpoint URL for thermostat temperature setting
-            url = "https://lk-arc-structure-mapper.azurewebsites.net/api/measurement/sense"
-
-            # Get base headers from _get_headers() method
-            headers = {
-                **self._get_headers(),
-                "authorization": f"Bearer {self.jwt_token}",
+        success, response_data = await self._post(endpoint, {"temperature": temperature})
+        if not success:
+            return {
+                "success": False,
+                "data": None,
+                "error": f"Request to {self.BASE_URL + endpoint} failed",
             }
-
-            _LOGGER.debug(
-                "Using Azure endpoint for thermostat control with token: %s...",
-                self.jwt_token[:20] if self.jwt_token else "None",
-            )
-
-            # Create simple payload according to the required format
-            payload = {"temperature": temperature, "mac": device_id}
-
-            _LOGGER.debug(
-                "Setting thermostat %s to temperature %s with payload: %s",
-                device_id,
-                temperature,
-                payload,
-            )
-
-            # Make the API request
-            async with self.session.post(url, headers=headers, json=payload) as resp:
-                if resp.status != 200 and resp.status != 201 and resp.status != 202:
-                    error_text = await resp.text()
-                    result["error"] = f"API error {resp.status}: {error_text}"
-                    return result
-
-                # Parse the response
-                try:
-                    response_data = await resp.json()
-                    result["data"] = response_data
-
-                    # Update our cached measurement data with the complete response
-                    # The response contains full device state including all measurements
-                    if device_id in self._device_measurements:
-                        # Log the complete response for debugging
-                        _LOGGER.debug(
-                            "Received updated device state: %s", response_data
-                        )
-
-                        # Update all fields from the response
-                        if isinstance(response_data, dict):
-                            # Store the complete state including currentTemperature, currentHumidity, etc.
-                            self._device_measurements[device_id].update(response_data)
-                            _LOGGER.debug(
-                                "Updated cached device state for %s", device_id
-                            )
-                except Exception as json_err:
-                    # Handle case where response might not be JSON
-                    result["data"] = await resp.text()
-                    _LOGGER.warning(
-                        "Failed to parse thermostat response as JSON: %s", json_err
-                    )
-
-                result["success"] = True
-                return result
-
-        except Exception as ex:
-            result["error"] = f"Exception: {str(ex)}"
-            return result
+        return {"success": True, "data": response_data, "error": None}
 
     @property
     def arc_sense_measurements(self):
@@ -1016,8 +1181,8 @@ class LKSystemsManager:
     async def cubic_secure_set_thresholds(
         self, cubic_identity: str, threshold: LKThresholds
     ):
-        """Set threshold"""
-        endpoint = f"control/cubic/secure/{cubic_identity}/threshold"
+        """Set leak-detection thresholds"""
+        endpoint = f"control/cubic/secure/{cubic_identity}/thresholds"
         payload = threshold
         success, res = await self._post(endpoint, payload)
         if success:

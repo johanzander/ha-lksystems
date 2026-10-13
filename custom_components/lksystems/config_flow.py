@@ -119,16 +119,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_abort(reason="reauth_failed")
 
     async def async_step_user(self, user_input=None):
-        """Handle the initial step."""
+        """Handle the initial step.
+
+        This integration only supports one config entry at a time - Home
+        Assistant's own flow manager rejects a second attempt (for this
+        username or any other) before this step ever runs, so there's no
+        duplicate-entry check to make here.
+        """
         errors = {}
 
         if user_input is not None:
-            # Check if we already have an entry for this username
-            existing_entries = self._async_current_entries()
-            for entry in existing_entries:
-                if entry.data.get(CONF_USERNAME) == user_input[CONF_USERNAME]:
-                    return self.async_abort(reason="already_configured")
-
             # Store data and create entry
             return self.async_create_entry(
                 title=f"LK Systems ({user_input[CONF_USERNAME]})",
@@ -153,7 +153,8 @@ class OptionsFlowHandler(OptionsFlow):
     
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow with config entry."""
-        self.config_entry = config_entry
+        self._config_entry = config_entry
+        super().__init__()
 
     async def async_step_init(self, user_input=None):
         """Manage the options."""
@@ -161,7 +162,7 @@ class OptionsFlowHandler(OptionsFlow):
             return self.async_create_entry(title="", data=user_input)
 
         # Get current options or provide defaults
-        options = self.config_entry.options or {}
+        options = self._config_entry.options or {}
         update_interval = options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         
         return self.async_show_form(

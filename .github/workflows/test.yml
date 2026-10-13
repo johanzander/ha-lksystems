@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # pytest-homeassistant-custom-component / homeassistant require >=3.12
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: pip install -r requirements_test.txt
+
+      - name: Run tests
+        # pytest-homeassistant-custom-component registers a global autouse
+        # cleanup fixture the moment it's installed, which collides with
+        # this suite (see requirements_test.txt) - explicitly disabled here.
+        run: pytest tests/ -p no:homeassistant -v
+
+      - name: Run Home Assistant integration tests
+        run: pytest tests_ha/ -v
